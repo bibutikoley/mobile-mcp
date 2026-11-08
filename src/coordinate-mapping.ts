@@ -46,3 +46,19 @@ export const describeCoordinateMapping = (screenshot: Dimensions, reportedScreen
 	const y = formatRatio(screen.height / screenshot.height);
 	return `Screenshot is ${screenshot.width}x${screenshot.height}. Screen coordinates are ${screen.width}x${screen.height}. To tap something you see in this screenshot, multiply its x by ${x} and y by ${y}.`;
 };
+
+/**
+ * Converts a point in screenshot pixels into screen (tap) coordinates.
+ * Returns null when either size is unknown, a tap position would be a guess.
+ */
+export const imageToScreenPoint = (point: { x: number, y: number }, screenshot: Dimensions, reportedScreen: Dimensions): { x: number, y: number } | null => {
+	if (!isPositive(screenshot) || !isPositive(reportedScreen)) {
+		return null;
+	}
+
+	const screen = orientLike(reportedScreen, screenshot);
+	return {
+		x: Math.round(point.x * screen.width / screenshot.width),
+		y: Math.round(point.y * screen.height / screenshot.height),
+	};
+};

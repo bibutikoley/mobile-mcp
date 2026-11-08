@@ -8,16 +8,17 @@ import { ChildProcess } from "node:child_process";
 
 import { error, trace } from "./logger";
 import { AndroidRobot, AndroidDeviceManager } from "./android";
-import { ActionableError, Dimensions, Robot, ScreenshotOptions } from "./robot";
+import { ActionableError, Robot, ScreenshotOptions } from "./robot";
 import { IosManager, IosRobot } from "./ios";
-import { PNG } from "./png";
-import { getJpegDimensions } from "./jpeg";
+import { captureScreenshot } from "./screenshot";
 import { describeCoordinateMapping } from "./coordinate-mapping";
 import { Mobilecli } from "./mobilecli";
 import { MobileDevice } from "./mobile-device";
 import { validateOutputPath, validateFileExtension, withLowercaseScheme, writeOutputFile, createPrivateOutputPath, finishRecording } from "./utils";
-import { formatElements } from "./format-elements";
+import { filterElements, formatElements } from "./format-elements";
 import { shouldSendEvent } from "./telemetry-quota";
+import { buildLocators, readLocatorConfig, runChain, sendsScreenshots } from "./locator/chain";
+import { LocateContext } from "./locator/types";
 
 type ScreenshotContent = { type: "text", text: string } | { type: "image", data: string, mimeType: string };
 
@@ -83,7 +84,21 @@ export const getSdkVersion = (): string => {
 	}
 };
 
-const SERVER_INSTRUCTIONS = `Drive a real or simulated iOS/Android device.
+const READ_THE_SCREEN = `Read the screen with mobile_list_elements_on_screen, not screenshots: it returns
+refs, coordinates and labels, and tapping by ref survives layout differences
+between devices. Fall back to mobile_take_screenshot only for elements missing
+from the hierarchy, or to judge visual appearance.`;
+
+// used once the locator steps or compact element lists are configured
+const READ_THE_SCREEN_WITH_LOCATOR = `To act on one specific element, call mobile_find_element with a plain-language
+description (optionally tap: true). It searches the UI hierarchy first and only
+falls back to configured models, and it returns a ref or coordinates in a few
+words. Use mobile_list_elements_on_screen (pass query to narrow it) to explore
+a screen: it returns refs, coordinates and labels, and tapping by ref survives
+layout differences between devices. Use mobile_take_screenshot only when
+mobile_find_element cannot find the element, or to judge visual appearance.`;
+
+const serverInstructions = (readTheScreen: string): string => `Drive a real or simulated iOS/Android device.
 
 Start with mobile_list_available_devices and pass the chosen device id to every
 later call - there is no implicit "current device". Use a remote device only
@@ -91,10 +106,7 @@ when local ones do not fit or when requested by the user. Remote devices cost
 money and take time to allocate and release. Release when done using, so the
 remote device cleans and returns to pool.
 
-Read the screen with mobile_list_elements_on_screen, not screenshots: it returns
-refs, coordinates and labels, and tapping by ref survives layout differences
-between devices. Fall back to mobile_take_screenshot only for elements missing
-from the hierarchy, or to judge visual appearance.
+${readTheScreen}
 
 Each call is a device round-trip. Group known sequences (tap, type, tap) into
 mobile_batch_commands instead of issuing them one at a time.
@@ -106,11 +118,22 @@ so do not rely on it for app deep links.`;
 
 export const createMcpServer = (): McpServer => {
 
+	// read first: an invalid locator setting should stop the server, not fail at call time
+	const locatorConfig = readLocatorConfig();
+	const locators = buildLocators(locatorConfig);
+	const screenshotEndpoints = sendsScreenshots(locatorConfig);
+
+	// with nothing configured the instructions stay as they always were
+	const base = serverInstructions(locatorConfig.compactElements ? READ_THE_SCREEN_WITH_LOCATOR : READ_THE_SCREEN);
+	const instructions = screenshotEndpoints.length === 0
+		? base
+		: `${base}\n\nmobile_find_element may send screenshots to: ${screenshotEndpoints.join(", ")}.`;
+
 	const server = new McpServer({
 		name: "mobile-mcp",
 		version: getAgentVersion(),
 	}, {
-		instructions: SERVER_INSTRUCTIONS,
+		instructions,
 	});
 
 
@@ -804,9 +827,14 @@ export const createMcpServer = (): McpServer => {
 		{
 			device: z.string().describe("The device identifier to use. Use mobile_list_available_devices to find which devices are available to you."),
 			format: z.enum(["text", "json", "raw"]).default("text").describe("Output format. \"text\" (default) is one compact line per element, \"json\" is a json array, \"raw\" is the unfiltered platform-specific hierarchy as JSON (mobilecli only). Raw nodes may be offscreen and do not have element refs"),
+			// only offered with compact lists, so the default tool schema stays as it was
+			...(locatorConfig.compactElements ? {
+				query: z.string().optional().describe("Only return elements whose text, label, name, value or id contains this text (case-insensitive). Use it when looking for something specific, it saves a lot of output"),
+				all: z.boolean().optional().describe("Return every node, including layout containers, off-screen nodes and repeated text. Defaults to false"),
+			} : {}),
 		},
 		{ readOnlyHint: true, openWorldHint: true },
-		async ({ device, format }) => {
+		async ({ device, format, query, all }) => {
 			const robot = getRobotFromDevice(device);
 			if (format === "raw") {
 				if (!robot.getRawUIHierarchy) {
@@ -816,7 +844,19 @@ export const createMcpServer = (): McpServer => {
 			}
 
 			const elements = await robot.getElementsOnScreen();
-			return formatElements(elements, format);
+			if (!locatorConfig.compactElements) {
+				return formatElements(elements, format);
+			}
+
+			// the screen size bounds off-screen nodes (carousels); listing still works without it
+			const screen = all ? undefined : await robot.getScreenSize().catch(() => undefined);
+			const shown = filterElements(elements, { query, all, screen });
+			const output = formatElements(shown, format ?? "text", { compact: !all });
+			if (query && shown.length === 0) {
+				return `No element matches "${query}". Try a shorter query, mobile_find_element, or list without a query`;
+			}
+
+			return output;
 		}
 	);
 
@@ -978,24 +1018,7 @@ export const createMcpServer = (): McpServer => {
 					options.maxSize = DEFAULT_SCREENSHOT_MAX_SIZE;
 				}
 
-				const screenshot = await robot.getScreenshot(options);
-
-				const isJpeg = screenshot.length > 2 && screenshot[0] === 0xff && screenshot[1] === 0xd8;
-				let mimeType = "image/jpeg";
-				let screenshotSize: Dimensions;
-				if (isJpeg) {
-					screenshotSize = getJpegDimensions(screenshot);
-				} else {
-					mimeType = "image/png";
-
-					// validate we received a png, will throw exception otherwise
-					const image = new PNG(screenshot);
-					screenshotSize = image.getDimensions();
-				}
-
-				if (screenshotSize.width <= 0 || screenshotSize.height <= 0) {
-					throw new ActionableError("Screenshot is invalid. Please try again.");
-				}
+				const { buffer: screenshot, mimeType, size: screenshotSize } = await captureScreenshot(robot, options);
 
 				// the screenshot is downscaled (and on ios the screen is in points while pixels are not),
 				// so tell the model how to map what it sees onto tap coordinates. see #29.
@@ -1316,6 +1339,52 @@ export const createMcpServer = (): McpServer => {
 			ensureMobilecliAvailable();
 			const response = mobilecli.crashesGet(device, id);
 			return response.data.content;
+		}
+	);
+
+	const stepNames = locators.map(locator => locator.name).join(" -> ");
+
+	tool(
+		"mobile_find_element",
+		"Find Element",
+		`Find one element on screen from a plain-language description, e.g. "the Sign in button" or "search field", and optionally tap it. Much cheaper than listing all elements or taking a screenshot. Steps tried in order until one is confident: ${stepNames}. Returns the element's ref (when it is in the UI hierarchy) and screen coordinates.${screenshotEndpoints.length > 0 ? ` Steps after the UI hierarchy send a screenshot to ${screenshotEndpoints.join(", ")}.` : ""}`,
+		{
+			device: z.string().describe("The device identifier to use. Use mobile_list_available_devices to find which devices are available to you."),
+			query: z.string().min(1).describe("What to find, as text on it or a short description, e.g. \"Sign in\" or \"the settings gear icon\""),
+			tap: z.boolean().optional().describe("Tap the element once found. Defaults to false"),
+		},
+		{ readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+		async ({ device, query, tap }, telemetry) => {
+			const robot = getRobotFromDevice(device);
+			const ctx = new LocateContext(robot);
+			const started = Date.now();
+			const { result, trace: steps } = await runChain(locators, ctx, query);
+			const elapsed = `${((Date.now() - started) / 1000).toFixed(1)}s`;
+			telemetry.LocatorMs = Date.now() - started;
+			const trace = steps.length > 0 ? ` (${steps.join("; ")})` : "";
+
+			if (result === null) {
+				telemetry.LocatorSource = "none";
+				throw new ActionableError(`Could not find "${query}" on screen in ${elapsed}${trace}. Try mobile_list_elements_on_screen, or mobile_take_screenshot`);
+			}
+
+			// on success the trace is only for tuning, a few dozen tokens the agent does not need
+			const details = ` in ${elapsed}${locatorConfig.trace ? trace : ""}`;
+
+			telemetry.LocatorSource = result.source.split("/")[0];
+			const where = `${result.ref ? `${result.ref} ` : ""}at ${result.point.x},${result.point.y}`;
+			const found = `Found "${query}" ${where} via ${result.source} (${result.confidence})`;
+			if (!tap) {
+				return `${found}${details}`;
+			}
+
+			if (result.ref && robot.tapByRef) {
+				await robot.tapByRef(result.ref);
+			} else {
+				await robot.tap(result.point.x, result.point.y);
+			}
+
+			return `${found} and tapped it${details}`;
 		}
 	);
 

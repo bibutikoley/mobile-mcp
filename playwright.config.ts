@@ -5,6 +5,8 @@ import { defineConfig } from "@playwright/test";
 export default defineConfig({
 	testDir: "./test",
 	testMatch: "*.ts",
+	// shared helpers, not tests
+	testIgnore: "support/**",
 
 	// Device tests (android/ios/iphone-simulator) mutate real device state and
 	// must run serially, exactly as they did under mocha's single process.

@@ -1,3 +1,7 @@
+## Unreleased
+* Feat: `mobile_find_element` finds one element from a plain-language description and optionally taps it. It tries the UI hierarchy first, then optional self-hosted embedding, decision (Kev or Nimble) and vision (any OpenAI-compatible) models configured by `MOBILEMCP_*` env vars, and returns a single line instead of a full element list or a screenshot
+* Feat: Optional compact element lists (`MOBILEMCP_COMPACT_ELEMENTS=1`, on by default when a model step is configured): `mobile_list_elements_on_screen` leaves out empty containers, off-screen nodes and repeated text, caps labels at 200 characters, and accepts `query` and `all`. With nothing configured the list is unchanged
+
 ## [1.0.16](https://github.com/mobile-next/mobile-mcp/releases/tag/1.0.16) (2026-11-02)
 * Feat: `mobile_list_elements_on_screen` accepts `format: "raw"` to return the unfiltered platform UI hierarchy, including parent nodes and values the compact output drops ([#548](https://github.com/mobile-next/mobile-mcp/pull/548)), thanks to [@ProgramComputer](https://github.com/ProgramComputer)
 * Chore: Telemetry events are capped per user per day ([#547](https://github.com/mobile-next/mobile-mcp/pull/547))

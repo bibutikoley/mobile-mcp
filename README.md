@@ -123,7 +123,8 @@ How we help to scale mobile automation:
 ### Screen Interaction
 - **`mobile_take_screenshot`** - Take a screenshot to understand what's on screen
 - **`mobile_save_screenshot`** - Save a screenshot to a file
-- **`mobile_list_elements_on_screen`** - List UI elements with their coordinates and properties
+- **`mobile_find_element`** - Find one element from a plain-language description and optionally tap it, using the UI hierarchy first and optional local models after (see [Locator chain](#locator-chain-optional-models))
+- **`mobile_list_elements_on_screen`** - List UI elements with their coordinates and properties (with compact lists on, also filtered by `query`)
 - **`mobile_click_on_screen_at_coordinates`** - Click at specific x,y coordinates or on an element by its ref
 - **`mobile_double_tap_on_screen`** - Double-tap at specific coordinates or on an element by its ref
 - **`mobile_long_press_on_screen_at_coordinates`** - Long press at specific coordinates or on an element by its ref
@@ -546,6 +547,45 @@ Gmail to contacts "team@example.com".
 | `MOBILEMCP_DISABLE_TELEMETRY` | Disable anonymous usage telemetry. | `MOBILEMCP_DISABLE_TELEMETRY=1` |
 | `MOBILEMCP_ALLOW_UNSAFE_URLS` | Allow `mobile_open_url` to open non-standard URL schemes (blocked by default). | `MOBILEMCP_ALLOW_UNSAFE_URLS=1` |
 | `MOBILEMCP_LEGACY_ROBOT` | Use the legacy platform-specific robots for Android devices and physical iOS devices. iOS simulators continue to use `mobilecli`. | `MOBILEMCP_LEGACY_ROBOT=1` |
+| `MOBILEMCP_EMBED_BASE_URL`, `_MODEL`, `_API_KEY` | OpenAI-compatible `/embeddings` endpoint for the `embed` locator step. | `http://localhost:11434/v1`, `embeddinggemma` |
+| `MOBILEMCP_EMBED_TOP_K`, `_MIN_SCORE`, `_MIN_MARGIN` | Candidates passed to the `decide` step (default `32`). Without a `decide` step, the embed step answers only when the best cosine score reaches `_MIN_SCORE` (default `0.7`) and leads the next element by `_MIN_MARGIN` (default `0.03`). | `16`, `0.75`, `0.05` |
+| `MOBILEMCP_DECIDE_BASE_URL`, `_MODEL`, `_API_KEY` | `/systemone` endpoint for the `decide` step: one decision model, Kev or Nimble, on Ollama. | `http://localhost:11434/v1`, `kev:4b` |
+| `MOBILEMCP_DECIDE_MIN_CONFIDENCE` | Probability needed to accept the decider's choice (default `0.6`). | `0.7` |
+| `MOBILEMCP_VISION_BASE_URL`, `_MODEL`, `_API_KEY` | OpenAI-compatible `/chat/completions` vision model for the `vision` step. | `http://localhost:11434/v1`, `qwen2.5vl:7b` |
+| `MOBILEMCP_LOCATOR_CHAIN` | Order and subset of locator steps. Defaults to every configured step in the order `lexical,embed,decide,vision`. | `lexical,decide,vision` |
+| `MOBILEMCP_LOCATOR_TIMEOUT_MS` | Timeout for each model request (default `30000`). | `10000` |
+| `MOBILEMCP_COMPACT_ELEMENTS` | Smaller `mobile_list_elements_on_screen` output: leaves out empty containers, off-screen nodes and repeated text, caps labels at 200 characters, and adds the `query` and `all` parameters. On by default when any model step is configured, off otherwise. | `MOBILEMCP_COMPACT_ELEMENTS=1` |
+| `MOBILEMCP_LOCATOR_TRACE` | Include each step's decision in successful `mobile_find_element` replies, for tuning thresholds. Failed lookups always include it. | `MOBILEMCP_LOCATOR_TRACE=1` |
+
+### Locator chain (optional models)
+
+`mobile_find_element` finds one element from a description such as "the Sign in button" and returns a ref or coordinates in a single line. That costs the agent far fewer tokens than reading a full element list or a screenshot. It runs these steps in order and stops at the first confident answer:
+
+| Step | Needs | What it does |
+|---|---|---|
+| `lexical` | nothing (always on) | Matches the description against element text, labels and ids |
+| `embed` | an embedding model, e.g. `embeddinggemma` | Ranks elements by meaning, so "log in" finds "Sign in". If a `decide` step follows, it only narrows the list to the top candidates. |
+| `decide` | one open decision model: [Kev](https://ollama.com/library/kev) or [Nimble](https://ollama.com/library/nimble) | Picks which candidate is meant, or answers "none", which skips straight to the `vision` step. Text only. |
+| `vision` | an OpenAI-compatible vision model, e.g. `qwen2.5vl:7b` | Finds the element on a screenshot, for things missing from the UI hierarchy (games, canvases, unlabelled icons) |
+
+Every model step is optional, open-source and self-hostable. All of these settings are optional. With none of them set, the server behaves as it always did, apart from the extra `mobile_find_element` tool, which then only uses `lexical`. Nothing leaves the machine. Kev and Nimble need Ollama 0.40.4 or later. The model names below are examples; any model that serves the same API works.
+
+Fully local on Apple Silicon (Kev's tags use the MLX runner):
+
+```bash
+ollama pull embeddinggemma kev:4b qwen2.5vl:7b
+claude mcp add mobile-mcp \
+  -e MOBILEMCP_EMBED_BASE_URL=http://localhost:11434/v1 -e MOBILEMCP_EMBED_MODEL=embeddinggemma \
+  -e MOBILEMCP_DECIDE_BASE_URL=http://localhost:11434/v1 -e MOBILEMCP_DECIDE_MODEL=kev:4b \
+  -e MOBILEMCP_VISION_BASE_URL=http://localhost:11434/v1 -e MOBILEMCP_VISION_MODEL=qwen2.5vl:7b \
+  -- npx @mobilenext/mobile-mcp@latest
+```
+
+On a Linux or GPU host, use `MOBILEMCP_DECIDE_MODEL=nimble`. Nimble prompts must fit in 8,192 tokens, and the decide step keeps its request under 64 KiB. For the vision step, any OpenAI-compatible server works, such as vLLM, LM Studio or llama.cpp. A GUI-grounding model served by vLLM usually points at elements more accurately than a general vision model.
+
+**Privacy:** the `vision` step sends a screenshot of the device to the configured endpoint, and the `embed` and `decide` steps send the text of on-screen elements. Point them at local servers to keep everything on your machine. The server's instructions to the agent list the endpoints that receive screenshots.
+
+**Troubleshooting:** a failed lookup ends with a short trace of what each step decided (set `MOBILEMCP_LOCATOR_TRACE=1` to get it on successful ones too), e.g. `(lexical: no match; decide/kev:4b: none 0.94, present 0.03; vision/qwen2.5vl:7b: coordinates read as 0-1000)`. If taps from the vision step land in the wrong place, the "read as" part shows which coordinate format the model's answer was taken to use. A vision hit on a heading that the query names, with exactly one tappable element in its row (e.g. "Watchlist" and its "See all" link), is moved to that element and the trace says "snapped"; any other vision hit is tapped where the model put it.
 
 ### Simulators, Emulators, and Real Devices
 

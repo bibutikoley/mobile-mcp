@@ -22,6 +22,7 @@ const expectedAnnotations: ToolAnnotationMatrix = {
 	mobile_double_tap_on_screen: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
 	mobile_long_press_on_screen_at_coordinates: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
 	mobile_list_elements_on_screen: { readOnlyHint: true, openWorldHint: true },
+	mobile_find_element: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
 	mobile_press_button: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
 	mobile_open_url: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
 	mobile_swipe_on_screen: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
